@@ -1,7 +1,7 @@
 {
   "name": "jet7-server",
-  "version": "1.0.0",
-  "description": "",
+  "version": "2.0.0",
+  "description": "JET7 2.0 — arbitragem de stablecoins (DRY_RUN por defeito), página PWA integrada e Postgres opcional",
   "main": "server.js",
   "scripts": {
     "start": "MALLOC_ARENA_MAX=2 node --max-old-space-size=300 --max-semi-space-size=4 --expose-gc server.js",
@@ -14,7 +14,8 @@
     "ccxt": "^4.5.88",
     "cors": "^2.8.6",
     "dotenv": "^18.0.8",
-    "express": "^5.3.0"
+    "express": "^5.3.0",
+    "pg": "^8.16.3"
   },
   "engines": {
     "node": ">=18"

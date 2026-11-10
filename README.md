@@ -1,4 +1,29 @@
-# Servidor JET7 — Modo Real
+# JET7 2.0.0
+
+Servidor JET7 + página JET7 no mesmo endereço, instalável como app (PWA) no telemóvel e no computador.
+
+## Novidades da 2.0.0
+- **Página integrada**: abra o endereço do servidor (ex.: https://jet7-server.onrender.com) e a página JET7 aparece. O servidor padrão da página passa a ser esse próprio endereço; pode colar outro URL no campo "URL do servidor".
+- **Instalar como app**: no Chrome/Edge (Android, Windows, Mac) aparece o botão **Instalar app**; no iPhone use Partilhar → "Adicionar ao ecrã principal". O service worker só guarda os ficheiros da página; a API (`/api`, `/client`, `/public/*`) nunca fica em cache.
+- **Base de dados Postgres (Supabase)**, ativa quando existe `DATABASE_URL`. As tabelas são criadas sozinhas no arranque: `users`, `api_keys` (chaves encriptadas com MASTER_KEY, como antes), `trades` (histórico e simulações, incluindo `fiat_sim`), `payments`, `licenses`, `settings` (autobot, botão de emergência, inventário simulado) e `daily_stats`.
+  - Na primeira vez, com a BD vazia e `GITHUB_TOKEN`, importa os dados dos Gists (histórico, autobot, pagamentos, contas) e dos ficheiros locais.
+  - Escritas em lote a cada ~2,5 s, só com o que mudou; pool com no máximo 3 ligações (Render Free 512 MB).
+  - Cópia de segurança diária da BD para o Gist (com `GITHUB_TOKEN`), nos mesmos ficheiros da 1.x — pode voltar à 1.x sem perder dados.
+  - Sem `DATABASE_URL`, tudo funciona exatamente como na 1.16 (Gist + ficheiros).
+- `GET /api/health` mostra `storage: "postgres" | "gist"` e o estado da BD. Novos: `GET /api/daily-stats?days=30`, `POST /api/backup`, `GET /ping`.
+
+## Regras que não mudam
+- `DRY_RUN=true` por defeito: só simulação, nenhuma ordem real.
+- Sem P2P fiat (USDT/fiat só no livro spot e só em simulação). DEX só em vigilância (sem carteira).
+
+## Supabase em 3 passos
+1. Crie um projeto em supabase.com (região UE, ex.: Frankfurt).
+2. Project Settings → Database → Connection string → copie o URI (de preferência o "Session/Transaction pooler") com a palavra-passe da BD.
+3. No Render → Environment → `DATABASE_URL` = esse URI → guardar. No arranque, o servidor cria as tabelas e importa os Gists.
+
+---
+
+# Servidor JET7 — Modo Real (guia da 1.x, continua válido)
 
 Este servidor liga o Modo Real da página JET7 às corretoras. As chaves API ficam encriptadas aqui, nunca no telemóvel.
 

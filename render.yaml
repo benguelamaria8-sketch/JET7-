@@ -1,4 +1,4 @@
-# JET7 — Blueprint do Render (recria o servidor a partir deste repositório)
+# JET7 2.0 — Blueprint do Render (servidor + página PWA no mesmo endereço)
 # Segurança: DRY_RUN=true (simulação). Nunca mudar para false sem decisão explícita.
 services:
   - type: web
@@ -22,13 +22,17 @@ services:
       - key: FIAT_BANK_FEE_PCT
         value: "0"
       # Segredos: o Render pede estes valores ao criar o Blueprint (não ficam no GitHub)
+      # gerados pelo Render ao criar (veja-os em Environment); pode substituir pelos antigos
       - key: ACCESS_TOKEN
-        sync: false
+        generateValue: true
       - key: MASTER_KEY
-        sync: false
+        generateValue: true
       - key: GITHUB_TOKEN
         sync: false
       - key: GIST_ID
+        sync: false
+      # 2.0.0: Postgres (Supabase) — sem este valor o servidor continua a usar o Gist como na 1.x
+      - key: DATABASE_URL
         sync: false
       - key: PAY_ADDRESS
         sync: false

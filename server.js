@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.16.0';
+const VERSION = '2.0.1';
 const PORT = process.env.PORT || 8080;
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 const MASTER_KEY = process.env.MASTER_KEY || '';
@@ -32,10 +32,29 @@ const HIST_FILE = path.join(DATA_DIR, 'history.json');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 if (!ACCESS_TOKEN || ACCESS_TOKEN.length < 24) { console.error('Defina ACCESS_TOKEN (mín. 24 caracteres) no .env'); process.exit(1); }
-if (!/^[0-9a-f]{64}$/i.test(MASTER_KEY)) { console.error('Defina MASTER_KEY com 64 caracteres hex (npm run gerar-chaves)'); process.exit(1); }
+// MASTER_KEY: 64 hex (como na 1.x) ou qualquer texto com 32+ caracteres (ex.: valor gerado pelo Render), convertido com SHA-256
+if (!/^[0-9a-f]{64}$/i.test(MASTER_KEY) && MASTER_KEY.length < 32) { console.error('Defina MASTER_KEY (64 hex ou 32+ caracteres)'); process.exit(1); }
+
+// ---------- 2.0.0: camada de armazenamento ----------
+// DATABASE_URL definido -> Postgres (Supabase): users, api_keys, trades, payments, licenses, settings, daily_stats.
+// Sem DATABASE_URL -> exatamente como na 1.x (ficheiros em data/ + Gist privado com GITHUB_TOKEN).
+const DATABASE_URL = (process.env.DATABASE_URL || '').trim();
+const PG = !!DATABASE_URL;
+const STORAGE = PG ? 'postgres' : 'gist';
+const TRADES_KEEP_DAYS = Number(process.env.TRADES_KEEP_DAYS ?? 90);   // trades mais antigos são apagados da BD (daily_stats fica)
+const BACKUP_EVERY_H = Number(process.env.BACKUP_EVERY_H ?? 24);       // cópia da BD para o Gist (com GITHUB_TOKEN)
+const db = PG ? require('./storage-pg').createPgStore({ url: DATABASE_URL, ssl: String(process.env.DATABASE_SSL ?? 'true').toLowerCase() !== 'false', flushMs: Number(process.env.DB_FLUSH_MS ?? 2500) }) : null;
+let ownerKeyMem = null;   // chaves do dono (modo postgres: em memória, carregadas da BD)
+const ownerKeys = () => (PG && ownerKeyMem) ? ownerKeyMem : readJSON(KEYS_FILE, {});
+function saveOwnerKey(exchange, value) {
+  const store = { ...ownerKeys() };
+  if (value) store[exchange] = value; else delete store[exchange];
+  writeJSON(KEYS_FILE, store);
+  if (PG) { ownerKeyMem = store; if (value) db.putKey('', exchange, value); else db.delKey('', exchange); }
+}
 
 // ---------- encriptação das chaves API (AES-256-GCM) ----------
-const KEY = Buffer.from(MASTER_KEY, 'hex');
+const KEY = /^[0-9a-f]{64}$/i.test(MASTER_KEY) ? Buffer.from(MASTER_KEY, 'hex') : crypto.createHash('sha256').update(MASTER_KEY).digest();
 function enc(obj) {
   const iv = crypto.randomBytes(12);
   const c = crypto.createCipheriv('aes-256-gcm', KEY, iv);
@@ -63,7 +82,7 @@ function spotOpts(id) {
   return o;
 }
 function buildClient(id) {
-  const store = readJSON(KEYS_FILE, {});
+  const store = ownerKeys();
   const creds = store[id] ? dec(store[id]) : envCreds(id);
   const ex = new ccxt[id]({ enableRateLimit: true, timeout: 15000, options: spotOpts(id), ...creds });
   // 1.9.5: qualquer chamada interna do ccxt (fetchBalance, fetchOrderBook...) passa pelo carregamento leve e em fila,
@@ -82,7 +101,7 @@ function envCreds(id) {
   if (!k || !s) return {};
   const c = { apiKey: k.trim(), secret: s.trim() }; if (pw) c.password = pw.trim(); return c;
 }
-const hasKeys = id => !!readJSON(KEYS_FILE, {})[id] || !!envCreds(id).apiKey;
+const hasKeys = id => !!ownerKeys()[id] || !!envCreds(id).apiKey;
 
 // carrega mercados UMA corretora de cada vez e guarda só os pares do JET7 (poupa centenas de MB no Render Free)
 let marketLock = Promise.resolve();
@@ -273,6 +292,33 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '50kb' }));
 app.use(cors({ origin: ALLOWED_ORIGINS.includes('*') ? true : ALLOWED_ORIGINS }));
+// 2.0.0: a página JET7 (PWA) é servida pelo próprio servidor, no mesmo endereço. /api, /client e /public/* continuam a ser a API.
+const PUBLIC_DIR = path.join(__dirname, 'public');
+// Modo "plano": se não existir a pasta public/ (upload pelo telemóvel sem pastas), serve os mesmos ficheiros a partir da raiz.
+if (!fs.existsSync(PUBLIC_DIR)) {
+  const FLAT = { '/': 'index.html', '/index.html': 'index.html', '/manifest.webmanifest': 'manifest.webmanifest', '/sw.js': 'sw.js',
+    '/icons/icon-192.png': 'icon-192.png', '/icons/icon-512.png': 'icon-512.png', '/icons/maskable-512.png': 'maskable-512.png', '/icons/apple-touch-icon.png': 'apple-touch-icon.png' };
+  app.get(Object.keys(FLAT), (req, res, next) => {
+    const f = path.join(__dirname, FLAT[req.path]); if (!fs.existsSync(f)) return next();
+    const b = FLAT[req.path];
+    res.setHeader('Cache-Control', (b === 'sw.js' || b === 'index.html' || b.endsWith('.webmanifest')) ? 'no-cache' : 'public, max-age=604800');
+    if (b === 'sw.js') res.setHeader('Service-Worker-Allowed', '/');
+    if (b.endsWith('.webmanifest')) res.type('application/manifest+json');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.sendFile(f);
+  });
+}
+app.use(express.static(PUBLIC_DIR, {
+  index: 'index.html', dotfiles: 'ignore', etag: true,
+  setHeaders: (res, f) => {
+    const b = path.basename(f);
+    if (b === 'sw.js' || b === 'index.html' || b.endsWith('.webmanifest')) res.setHeader('Cache-Control', 'no-cache');
+    else res.setHeader('Cache-Control', 'public, max-age=604800');
+    if (b === 'sw.js') res.setHeader('Service-Worker-Allowed', '/');
+    if (b.endsWith('.webmanifest')) res.type('application/manifest+json');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+  }
+}));
 // ---------- VIGILÂNCIA DEX (só leitura, sem carteira) ----------
 // Compara o USDC/USDT das corretoras com a KyberSwap em redes baratas. Avisa quando a diferença líquida de gás
 // passa de DEX_ALERT_PCT (0,3% por defeito), que já paga as transferências. Não envia nada para a blockchain.
@@ -341,7 +387,8 @@ const wrap = fn => (req, res) => fn(req, res).catch(e => res.status(500).json({ 
 app.get('/api/health', wrap(async (req, res) => {
   res.json({ ok: true, version: VERSION, dryRun: DRY_RUN, feeDiscount: FEE_DISCOUNT ? Object.fromEntries(Object.keys(FEE_TOKEN).map(id => [id, { token: FEE_TOKEN[id], balance: tokenBal[id]?.amount ?? null, active: discountOn(id), mult: FEE_MULT[id] }])) : false, stopped: STOPPED, symbols: SYMBOLS,
     memory: { rssMb: memState.rssMb, peakMb: memState.peakMb, cleanups: memState.cleanups, recycles: memState.recycles },
-    minProfitPct: MIN_PROFIT_PCT, maxOrderQuote: MAX_ORDER_QUOTE, autobot: { enabled: autobot.enabled, lastScanAt: autoState.lastScanAt, simulated: autoState.simulated, trades: autoState.trades }, historySync: { enabled: histSync.enabled, gist: !!gistId, lastOk: histSync.lastOk, lastError: histSync.lastError },
+    minProfitPct: MIN_PROFIT_PCT, maxOrderQuote: MAX_ORDER_QUOTE, autobot: { enabled: autobot.enabled, lastScanAt: autoState.lastScanAt, simulated: autoState.simulated, trades: autoState.trades }, historySync: { enabled: histSync.enabled && !PG, gist: !!gistId, lastOk: histSync.lastOk, lastError: histSync.lastError },
+    storage: STORAGE, db: PG ? db.status() : { enabled: false, fallback: GH_TOKEN ? 'gist' : 'ficheiros locais' },
     exchanges: EXCHANGES.map(id => ({ id, keys: hasKeys(id) })) });
 }));
 
@@ -404,13 +451,13 @@ app.post('/api/keys', wrap(async (req, res) => {
   // valida a chave antes de guardar
   const test = new ccxt[exchange]({ enableRateLimit: true, timeout: 15000, options: spotOpts(exchange), ...creds });
   try { await test.fetchBalance(); } catch (e) { return res.status(400).json({ ok: false, error: 'Chave recusada pela corretora: ' + e.message }); }
-  const store = readJSON(KEYS_FILE, {}); store[exchange] = enc(creds); writeJSON(KEYS_FILE, store);
+  saveOwnerKey(exchange, enc(creds));
   delete clients[exchange];
   res.json({ ok: true });
 }));
 
 app.delete('/api/keys/:exchange', wrap(async (req, res) => {
-  const store = readJSON(KEYS_FILE, {}); delete store[req.params.exchange]; writeJSON(KEYS_FILE, store);
+  saveOwnerKey(req.params.exchange, null);
   delete clients[req.params.exchange]; res.json({ ok: true });
 }));
 
@@ -535,7 +582,14 @@ async function executeTriangle(input) {
 app.get('/api/triangles', wrap(async (req, res) => res.json(await scanTriangles(Number(req.query.amount) || DEFAULT_AMOUNT))));
 app.post('/api/execute-triangle', wrap(async (req, res) => { const r = await executeTriangle({ ...(req.body || {}), source: 'manual' }); res.status(r.code).json(r.body); }));
 
-function record(t) { const h = readJSON(HIST_FILE, []); h.unshift({ at: new Date().toISOString(), ...t }); writeJSON(HIST_FILE, h.slice(0, 1000)); scheduleHistSync(); }
+// 2.0.0: em modo postgres o histórico recente (1000) fica em memória e cada registo segue em lote para a tabela trades
+let memHist = [];
+const histAll = () => PG ? memHist : readJSON(HIST_FILE, []);
+function record(t) {
+  const r = { at: new Date().toISOString(), ...t };
+  if (PG) { memHist.unshift(r); if (memHist.length > 1000) memHist.length = 1000; db.queueTrade('', r); return; }
+  const h = readJSON(HIST_FILE, []); h.unshift(r); writeJSON(HIST_FILE, h.slice(0, 1000)); scheduleHistSync();
+}
 
 // histórico persistente num Gist privado do GitHub (o disco do Render Free apaga-se a cada deploy).
 // Ativo só com GITHUB_TOKEN (token com permissão Gists: leitura e escrita). GIST_ID é opcional: o servidor encontra ou cria o gist.
@@ -571,7 +625,7 @@ async function loadHistFromGist() {
   } catch (e) { histSync.lastError = e.message; console.warn('Gist: ' + e.message); }
 }
 function scheduleHistSync() {
-  if (!GH_TOKEN) return;
+  if (!GH_TOKEN || PG) return;
   clearTimeout(syncTimer);
   syncTimer = setTimeout(async () => {
     try {
@@ -580,7 +634,7 @@ function scheduleHistSync() {
     } catch (e) { histSync.lastError = e.message; console.warn('Gist: ' + e.message); }
   }, 3000);
 }
-loadHistFromGist();
+if (!PG) loadHistFromGist();
 
 // PREVISÃO: quanto se ganha nesta rota antes de executar (não envia ordens)
 app.get('/api/preview', wrap(async (req, res) => {
@@ -1059,12 +1113,13 @@ function sanitizeAutobot(c) {
 }
 async function saveAutobot() {
   writeJSON(AUTOBOT_FILE, autobot);
+  if (PG) { db.setSetting('autobot', autobot); db.setSetting('stopped', { stopped: STOPPED, at: new Date().toISOString() }); return; }
   if (!GH_TOKEN) return;
   try { await gh('/gists/' + await findOrCreateGist(), { method: 'PATCH', body: JSON.stringify({ files: { [GIST_AUTOBOT]: { content: JSON.stringify(autobot, null, 1) } } }) }); }
   catch (e) { console.warn('Gist autobot: ' + e.message); }
 }
 async function loadAutobotFromGist() {
-  if (!GH_TOKEN) return;
+  if (!GH_TOKEN || PG) return;
   try {
     const g = await gh('/gists/' + await findOrCreateGist());
     const f = g.files[GIST_AUTOBOT];
@@ -1083,7 +1138,7 @@ let learnCache = { at: 0, map: new Map() };
 function routeLearning() {
   if (Date.now() - learnCache.at < 60000) return learnCache.map;
   const since = new Date(Date.now() - LEARN_HOURS * 3600000).toISOString(), map = new Map();
-  for (const t of readJSON(HIST_FILE, [])) {
+  for (const t of histAll()) {
     if (t.at < since || t.type !== 'maker' || t.status === 'held') continue;
     const k = routeKey(t.symbol, t.buyExchange, t.sellExchange), r = map.get(k) || { tries: 0, fills: 0, profit: 0, lastFill: null, lastTry: null };
     r.tries++; if ((t.filled || 0) > 0) { r.fills++; r.profit += t.netProfit || 0; if (!r.lastFill || t.at > r.lastFill) r.lastFill = t.at; }
@@ -1096,7 +1151,7 @@ function routeLearning() {
 }
 function stats24h() {
   const since = new Date(Date.now() - 86400000).toISOString(), st = { since, maker: { tries: 0, fills: 0, profit: 0 }, taker: { sims: 0, executed: 0, profit: 0 }, triangular: { sims: 0, profit: 0 }, transfer: { started: 0 }, held: 0, rebalance: { count: 0, cost: 0 }, ignoredNoKeys: 0, fiat: { sims: 0, profit: 0, byPair: {} } };
-  for (const t of readJSON(HIST_FILE, [])) {
+  for (const t of histAll()) {
     if (t.at < since || t.source === 'client') continue;
     if (t.status === 'held') { st.held++; continue; }
     if (t.type === 'fiat_sim') { st.fiat.sims++; st.fiat.profit += t.netProfit || 0; st.fiat.byPair[t.symbol] = (st.fiat.byPair[t.symbol] || 0) + 1; continue; }
@@ -1146,6 +1201,7 @@ function simApply(o, amt, netProfit) {
   simInv[o.buyExchange][q] = simBal(o.buyExchange, q) - cost; simInv[o.buyExchange][base] = simBal(o.buyExchange, base) + amt;
   simInv[o.sellExchange][base] = simBal(o.sellExchange, base) - amt; simInv[o.sellExchange][q] = simBal(o.sellExchange, q) + cost + (netProfit || 0);
   writeJSON(SIM_INV_FILE, simInv);
+  if (PG) db.setSetting('sim_inventory', simInv);
 }
 const TRANSFER_SCAN_MIN = Number(process.env.TRANSFER_SCAN_MIN ?? 15); let lastTransferScan = 0;
 async function autobotTick() {
@@ -1243,11 +1299,13 @@ app.post('/api/autobot', wrap(async (req, res) => {
   await saveAutobot(); scheduleAutobot();
   res.json(autobotStatus());
 }));
-(async () => { await loadAutobotFromGist(); if (autobot.enabled) { autoState.startedAt = new Date().toISOString(); console.log('Autobot a correr no servidor (24h)'); } scheduleAutobot(); })();
+function startAutobotLoop() { if (autobot.enabled) { autoState.startedAt = new Date().toISOString(); console.log('Autobot a correr no servidor (24h)'); } scheduleAutobot(); }
+// modo postgres: o Autobot só arranca depois de a BD ser lida (storageInit, no fim do ficheiro)
+if (!PG) (async () => { await loadAutobotFromGist(); startAutobotLoop(); })();
 
 app.post('/api/stop', wrap(async (req, res) => { setStopped(true); res.json({ ok: true, stopped: true }); }));
 app.post('/api/resume', wrap(async (req, res) => { setStopped(false); res.json({ ok: true, stopped: false }); }));
-app.get('/api/history', wrap(async (req, res) => res.json({ ok: true, trades: readJSON(HIST_FILE, []).slice(0, 200) })));
+app.get('/api/history', wrap(async (req, res) => res.json({ ok: true, trades: histAll().slice(0, 200) })));
 
 
 // ---------- VIGILANTE DE MEMÓRIA (1.9.4) ----------
@@ -1280,7 +1338,7 @@ setInterval(() => {
   if (r <= MEM_SOFT_MB) return;
   memCleanup(); r = memNow();
   if (r > MEM_HARD_MB && !busy()) { memRecycle(); r = memNow(); console.warn(`[mem] clientes ccxt recriados, rss=${r}MB`); }
-  if (r > MEM_EXIT_MB && !busy()) { console.warn(`[mem] rss=${r}MB acima de ${MEM_EXIT_MB}MB — reinício controlado`); setTimeout(() => process.exit(0), 200); }
+  if (r > MEM_EXIT_MB && !busy()) { console.warn(`[mem] rss=${r}MB acima de ${MEM_EXIT_MB}MB — reinício controlado`); setTimeout(safeExit, 200); }
 }, 5000).unref();
 app.get('/api/memory', (req, res) => { memNow(); res.json({ ok: true, ...memState, softMb: MEM_SOFT_MB, hardMb: MEM_HARD_MB, exitMb: MEM_EXIT_MB }); });
 
@@ -1307,6 +1365,7 @@ const r4 = x => Math.round(x * 10000) / 10000;
 const nowIso = () => new Date().toISOString();
 function savePay() {
   clearTimeout(paySaveTimer);
+  if (PG) { paySaveTimer = setTimeout(() => db.flush().catch(() => {}), 1500); return; }   // só grava as linhas que mudaram
   paySaveTimer = setTimeout(async () => {
     if (!GH_TOKEN) return;
     try { await gh('/gists/' + await findOrCreateGist(), { method: 'PATCH', body: JSON.stringify({ files: { [GIST_PAY]: { content: JSON.stringify(pay) } } }) }); }
@@ -1314,7 +1373,7 @@ function savePay() {
   }, 2000);
 }
 async function loadPay() {
-  if (!GH_TOKEN) return;
+  if (!GH_TOKEN || PG) return;
   try {
     const g = await gh('/gists/' + await findOrCreateGist());
     const f = g.files && g.files[GIST_PAY];
@@ -1456,6 +1515,7 @@ let users = [], usersSaveTimer = null;
 const SESSION_KEY = crypto.createHash('sha256').update(MASTER_KEY + ':jet7-session').digest();
 function saveUsers() {
   clearTimeout(usersSaveTimer);
+  if (PG) { clearTimeout(usersSaveTimer); usersSaveTimer = setTimeout(() => db.flush().catch(() => {}), 1500); return; }
   usersSaveTimer = setTimeout(async () => {
     if (!GH_TOKEN) return;
     try { await gh('/gists/' + await findOrCreateGist(), { method: 'PATCH', body: JSON.stringify({ files: { [GIST_USERS]: { content: JSON.stringify({ users }) } } }) }); }
@@ -1463,7 +1523,7 @@ function saveUsers() {
   }, 2000);
 }
 async function loadUsers() {
-  if (!GH_TOKEN) return;
+  if (!GH_TOKEN || PG) return;
   try {
     const g = await gh('/gists/' + await findOrCreateGist());
     const f = g.files && g.files[GIST_USERS];
@@ -1569,7 +1629,7 @@ function userClient(u, id) {
   return ex;
 }
 const dropUserEx = u => { for (const k of [...userEx.keys()]) if (k.startsWith(u.id + ':')) userEx.delete(k); };
-function userRecord(u) { return t => { u.hist = [{ at: nowIso(), ...t }, ...(u.hist || [])].slice(0, 200); saveUsers(); }; }
+function userRecord(u) { return t => { const r = { at: nowIso(), ...t }; u.hist = [r, ...(u.hist || [])].slice(0, 200); if (PG) db.queueTrade(u.id, r); saveUsers(); }; }
 const opsToday = u => { const d = new Date().toISOString().slice(0, 10); return (u.hist || []).filter(t => String(t.at).startsWith(d) && ['dry_run', 'executed', 'partial'].includes(t.status)).length; };
 function userCtx(u, f) {
   return { getEx: id => userClient(u, id), hasKeys: id => !!u.keys?.[id], record: userRecord(u), forceDry: !!f.forceDry, maxOrder: Math.min(f.maxOrder, MAX_ORDER_QUOTE * 50),
@@ -1590,10 +1650,10 @@ app.post('/client/keys', wrap(async (req, res) => {
   const test = new ccxt[exchange]({ enableRateLimit: true, timeout: 15000, options: spotOpts(exchange), ...creds });
   test.loadMarkets = async () => { if (!test.markets) test.setMarkets(Object.values(await ensureMarkets(client(exchange)))); return test.markets; };
   try { await test.fetchBalance(); } catch (e) { return res.status(400).json({ ok: false, error: 'Chave recusada pela corretora: ' + e.message }); }
-  req.user.keys = req.user.keys || {}; req.user.keys[exchange] = enc(creds); dropUserEx(req.user); saveUsers();
+  req.user.keys = req.user.keys || {}; req.user.keys[exchange] = enc(creds); if (PG) db.putKey(req.user.id, exchange, req.user.keys[exchange]); dropUserEx(req.user); saveUsers();
   res.json({ ok: true });
 }));
-app.delete('/client/keys/:exchange', (req, res) => { if (req.user.keys) delete req.user.keys[req.params.exchange]; dropUserEx(req.user); saveUsers(); res.json({ ok: true }); });
+app.delete('/client/keys/:exchange', (req, res) => { if (req.user.keys) delete req.user.keys[req.params.exchange]; if (PG && EXCHANGES.includes(req.params.exchange)) db.delKey(req.user.id, req.params.exchange); dropUserEx(req.user); saveUsers(); res.json({ ok: true }); });
 app.get('/client/balances', wrap(async (req, res) => {
   if (!needPlan(req, res)) return;
   const out = [];
@@ -1691,7 +1751,7 @@ setInterval(clientAutobotTick, 60000);
 // admin (dono): lista de clientes, sem chaves nem palavras-passe
 app.get('/api/users', (req, res) => res.json({ ok: true, users: users.map(u => ({ ...pubUser(u), lastLoginAt: u.lastLoginAt, disabled: !!u.disabled, stopped: !!u.stopped, opsToday: opsToday(u), lastAction: stOf(u).lastAction, profitSimUsdt: (u.hist || []).filter(t => t.status === 'dry_run').reduce((x, t) => x + (t.netProfit || 0), 0) })) }));
 app.post('/api/users/:id/disable', (req, res) => { const u = users.find(x => x.id === req.params.id); if (!u) return res.status(404).json({ ok: false, error: 'Não encontrado' }); u.disabled = req.body?.disabled !== false; if (u.disabled) { u.autobot.enabled = false; u.tv = (u.tv || 0) + 1; } saveUsers(); res.json({ ok: true, disabled: u.disabled }); });
-app.get('/', (req, res) => res.type('text').send('JET7 server ' + VERSION));
+app.get('/ping', (req, res) => res.type('text').send('JET7 server ' + VERSION));   // a página fica em / (public/index.html)
 
 // ---------- 1.16.0: ARBITRAGEM USDT/FIAT NO LIVRO SPOT (SÓ SIMULAÇÃO, SEM P2P) ----------
 // Como o Arb Desk (USDT/BRL): compra USDT com fiat na corretora A (ask), vende USDT por fiat na B (bid), pelo livro spot.
@@ -1759,7 +1819,120 @@ app.get('/api/fiat-opportunities', wrap(async (req, res) => {
     opportunities: c.list.slice(0, Number(req.query.limit) || 15).map(({ sig, ...o }) => o) });
 }));
 
+// ---------- 2.0.0: arranque do armazenamento Postgres, migração única, estatísticas diárias e cópia diária para o Gist ----------
+function gistContent(g, name) {
+  const f = g && g.files && g.files[name];
+  if (!f) return Promise.resolve(null);
+  if (!f.truncated) return Promise.resolve(f.content || null);
+  return fetch(f.raw_url).then(r => (r.ok ? r.text() : null)).catch(() => null);
+}
+const parseOr = (txt, def) => { try { return txt ? JSON.parse(txt) : def; } catch { return def; } };
+async function migrateLegacy() {
+  // BD vazia: importa o que a 1.x guardava (Gist, se houver GITHUB_TOKEN, e ficheiros locais em data/)
+  const local = { history: readJSON(HIST_FILE, []), autobot: readJSON(AUTOBOT_FILE, null), ownerKeys: readJSON(KEYS_FILE, {}), simInventory: readJSON(SIM_INV_FILE, null) };
+  let src = 'ficheiros locais', history = local.history, autobotL = local.autobot, payments = null, usersL = [];
+  if (GH_TOKEN) {
+    const g = await gh('/gists/' + await findOrCreateGist());   // um único pedido traz os 4 ficheiros
+    const [h, a, p, u] = await Promise.all([gistContent(g, GIST_FILE), gistContent(g, GIST_AUTOBOT), gistContent(g, GIST_PAY), gistContent(g, GIST_USERS)]);
+    const remote = parseOr(h, []), seen = new Set(), merged = [];
+    for (const t of [...history, ...(Array.isArray(remote) ? remote : [])]) { const k = t.at + '|' + (t.id || t.symbol || ''); if (!seen.has(k)) { seen.add(k); merged.push(t); } }
+    history = merged;
+    const ga = parseOr(a, null); if (ga) autobotL = { ...AUTOBOT_DEFAULT, ...ga };
+    const gp = parseOr(p, null); if (gp) payments = { orders: gp.orders || [], licenses: gp.licenses || [] };
+    const gu = parseOr(u, null); if (gu) usersL = gu.users || [];
+    src = 'gist' + (Object.keys(local.ownerKeys).length || local.history.length ? ' + ficheiros locais' : '');
+  }
+  if (!history.length && !autobotL && !payments && !usersL.length && !Object.keys(local.ownerKeys).length && !local.simInventory) return null;
+  const info = await db.importLegacy({ history, autobot: autobotL, payments, users: usersL, ownerKeys: local.ownerKeys, simInventory: local.simInventory, from: src });
+  console.log(`[db] migração única concluída (${src}): ${info.trades} registos, ${info.users} contas, ${info.orders} pedidos, ${info.licenses} licenças`);
+  return info;
+}
+async function storageInit() {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await db.init();
+      if (await db.isEmpty()) { try { await migrateLegacy(); } catch (e) { console.warn('[db] migração: ' + e.message.slice(0, 160)); } }
+      const migrated = db.state.migratedFrom && !db.state.migratedFrom.statsDone;
+      const d = await db.loadAll({ histMax: 1000, userHistMax: 200, ordersMax: 2000 });
+      // junta com o que já tiver entrado em memória antes de a BD responder (nada se perde)
+      const ids = new Set(d.hist.map(t => db.tradeKey(t)));
+      memHist = [...memHist.filter(t => !ids.has(db.tradeKey(t))), ...d.hist].sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, 1000);
+      const fileKeys = readJSON(KEYS_FILE, {});
+      ownerKeyMem = { ...fileKeys, ...d.ownerKeys };
+      for (const [ex, v] of Object.entries(fileKeys)) if (!d.ownerKeys[ex]) db.putKey('', ex, v);
+      for (const id of Object.keys(clients)) delete clients[id];
+      const oIds = new Set(d.pay.orders.map(o => o.id)), lKeys = new Set(d.pay.licenses.map(l => l.key));
+      pay = { orders: [...pay.orders.filter(o => !oIds.has(o.id)), ...d.pay.orders].slice(0, 2000), licenses: [...pay.licenses.filter(l => !lKeys.has(l.key)), ...d.pay.licenses] };
+      const uIds = new Set(d.users.map(u => u.id));
+      users = [...d.users, ...users.filter(u => !uIds.has(u.id))];
+      if (d.settings.autobot) autobot = { ...AUTOBOT_DEFAULT, ...d.settings.autobot };
+      if (autobot.stopped || d.settings.stopped?.stopped) { STOPPED = true; console.log('Botão de emergência continua ATIVO'); }
+      if (d.settings.sim_inventory && typeof d.settings.sim_inventory === 'object') simInv = d.settings.sim_inventory;
+      writeJSON(AUTOBOT_FILE, autobot);
+      db.setProviders({ pay: () => pay, users: () => users });
+      console.log(`[db] Postgres pronto: ${memHist.length} registos recentes, ${users.length} contas, ${pay.orders.length} pedidos, ${pay.licenses.length} licenças, autobot ${autobot.enabled ? 'LIGADO' : 'desligado'}`);
+      db.flush().catch(() => {});
+      startAutobotLoop();
+      // logo a seguir à migração, calcula daily_stats de todos os dias importados; depois só hoje e ontem
+      if (migrated) db.refreshDailyStats(true).catch(e => console.warn('[db] estatísticas: ' + e.message));
+      else setTimeout(() => db.refreshDailyStats().catch(e => console.warn('[db] estatísticas: ' + e.message)), 30000);
+      return true;
+    } catch (e) {
+      db.state.ok = false; db.state.lastError = String(e.message).replace(/postgres(ql)?:\/\/\S+/gi, 'postgres://***').slice(0, 200);
+      const wait = Math.min(30000 * attempt, 300000);
+      console.warn(`[db] Postgres indisponível (${db.state.lastError.slice(0, 120)}) — nova tentativa em ${wait / 1000}s`);
+      await sleep(wait);
+    }
+  }
+}
+async function backupToGist() {
+  if (!PG || !GH_TOKEN) return { ok: false, error: 'Cópia para o Gist precisa de DATABASE_URL e GITHUB_TOKEN' };
+  if (!db.state.ready) return { ok: false, error: 'Base de dados ainda não carregada' };
+  try {
+    await db.flush();
+    const at = nowIso(), counts = await db.counts(), dailyStats = await db.allDailyStats();
+    // os 4 ficheiros no formato da 1.x (permite voltar atrás sem perder dados) + um resumo da BD
+    const files = {
+      [GIST_FILE]: { content: JSON.stringify(histAll(), null, 1) },
+      [GIST_AUTOBOT]: { content: JSON.stringify(autobot, null, 1) },
+      [GIST_PAY]: { content: JSON.stringify(pay) },
+      [GIST_USERS]: { content: JSON.stringify({ users }) },
+      'jet7-db-backup.json': { content: JSON.stringify({ version: VERSION, at, storage: 'postgres', counts, simInventory: simInv, dailyStats }) }
+    };
+    await gh('/gists/' + await findOrCreateGist(), { method: 'PATCH', body: JSON.stringify({ files }) });
+    db.state.lastBackupAt = at; db.state.lastBackupError = null; db.setSetting('last_backup_at', { at, counts });
+    console.log(`[db] cópia de segurança no Gist: ${counts.trades} trades, ${counts.users} contas`);
+    return { ok: true, at, counts };
+  } catch (e) { db.state.lastBackupError = e.message.slice(0, 200); console.warn('[db] cópia Gist: ' + db.state.lastBackupError); return { ok: false, error: db.state.lastBackupError }; }
+}
+let lastPruneAt = 0;
+async function dbHousekeeping() {
+  if (!PG || !db.state.ready) return;
+  try { await db.refreshDailyStats(); } catch (e) { console.warn('[db] estatísticas: ' + e.message.slice(0, 120)); }
+  if (Date.now() - lastPruneAt > 86400000) { lastPruneAt = Date.now(); try { const n = await db.prune(TRADES_KEEP_DAYS); if (n) console.log(`[db] ${n} trades com mais de ${TRADES_KEEP_DAYS} dias apagados (daily_stats mantém o resumo)`); } catch (e) {} }
+  const last = Date.parse(db.state.lastBackupAt || 0) || 0;
+  if (GH_TOKEN && BACKUP_EVERY_H > 0 && Date.now() - last > BACKUP_EVERY_H * 3600000 && process.uptime() > 600) await backupToGist();
+}
+function safeExit() {
+  if (!PG) return process.exit(0);
+  Promise.race([db.flush(), sleep(5000)]).catch(() => {}).finally(() => process.exit(0));
+}
+// estatísticas diárias: na BD (daily_stats) ou, sem BD, calculadas a partir do histórico local
+app.get('/api/daily-stats', wrap(async (req, res) => {
+  const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 365);
+  if (PG && db.state.ready) { await db.flush().catch(() => {}); await db.refreshDailyStats().catch(() => {}); return res.json({ ok: true, storage: STORAGE, timezone: 'UTC', days: await db.dailyStats(days) }); }
+  const m = new Map(), since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+  for (const t of histAll()) { const day = String(t.at).slice(0, 10); if (day < since) continue; const k = day + '|' + (t.type || 'taker') + '|' + (t.status || ''); const r = m.get(k) || { day, type: t.type || 'taker', status: t.status || '', n: 0, netProfit: 0 }; r.n++; r.netProfit += t.netProfit || 0; m.set(k, r); }
+  res.json({ ok: true, storage: STORAGE, timezone: 'UTC', days: [...m.values()].sort((a, b) => b.day.localeCompare(a.day) || a.type.localeCompare(b.type)) });
+}));
+app.post('/api/backup', wrap(async (req, res) => { const r = await backupToGist(); res.status(r.ok ? 200 : 400).json(r); }));
+if (PG) {
+  storageInit();
+  setInterval(() => dbHousekeeping().catch(() => {}), 15 * 60000).unref();
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { console.log(`[db] ${sig}: a gravar o que falta antes de sair`); safeExit(); });
+}
+
 app.listen(PORT, () => console.log(`JET7 server ${VERSION} na porta ${PORT} — DRY_RUN=${DRY_RUN}`));
 // manter acordado no Render Free (adormece após 15 min sem visitas): ping ao próprio endereço público a cada 10 min
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
-if (SELF_URL) setInterval(() => fetch(SELF_URL + '/').catch(() => {}), 10 * 60000);
+if (SELF_URL) setInterval(() => fetch(SELF_URL + '/ping').catch(() => {}), 10 * 60000);

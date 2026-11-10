@@ -1,0 +1,68 @@
+# JET7 — Blueprint do Render (recria o servidor a partir deste repositório)
+# Segurança: DRY_RUN=true (simulação). Nunca mudar para false sem decisão explícita.
+services:
+  - type: web
+    name: jet7-server
+    runtime: node
+    plan: free
+    region: frankfurt
+    rootDir: .
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - key: DRY_RUN
+        value: "true"
+      - key: NODE_VERSION
+        value: "20"
+      - key: MIN_PROFIT_PCT
+        value: "0.10"
+      - key: SIM_INV_OPS
+        value: "16"
+      - key: FIAT_BANK_FEE_PCT
+        value: "0"
+      # Segredos: o Render pede estes valores ao criar o Blueprint (não ficam no GitHub)
+      - key: ACCESS_TOKEN
+        sync: false
+      - key: MASTER_KEY
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GIST_ID
+        sync: false
+      - key: PAY_ADDRESS
+        sync: false
+      - key: BINANCE_API_KEY
+        sync: false
+      - key: BINANCE_SECRET
+        sync: false
+      - key: BYBIT_API_KEY
+        sync: false
+      - key: BYBIT_SECRET
+        sync: false
+      - key: OKX_API_KEY
+        sync: false
+      - key: OKX_SECRET
+        sync: false
+      - key: OKX_PASSWORD
+        sync: false
+      - key: KUCOIN_API_KEY
+        sync: false
+      - key: KUCOIN_SECRET
+        sync: false
+      - key: KUCOIN_PASSWORD
+        sync: false
+      - key: BITGET_API_KEY
+        sync: false
+      - key: BITGET_SECRET
+        sync: false
+      - key: BITGET_PASSWORD
+        sync: false
+      - key: MEXC_API_KEY
+        sync: false
+      - key: MEXC_SECRET
+        sync: false
+      - key: GATE_API_KEY
+        sync: false
+      - key: GATE_SECRET
+        sync: false
